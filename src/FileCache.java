@@ -21,6 +21,10 @@ public class FileCache {
         this.mode.put(filePath, mode);
     }
 
+    public String getFileMode(String filePath) {
+        return this.mode.get(filePath);
+    }
+
     public String read(String filePath) {
        return cache.get(filePath);
     }
