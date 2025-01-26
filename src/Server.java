@@ -1,8 +1,7 @@
 // Server.java
 import java.io.*;
 import java.net.*;
-import java.util.HashMap;
-import java.util.Map;
+import java.nio.charset.StandardCharsets;
 import java.util.concurrent.ConcurrentHashMap;
 
 public class Server {
@@ -26,7 +25,6 @@ public class Server {
 
         try (ServerSocket serverSocket = new ServerSocket(PORT)) {
             System.out.println("Server is running on port " + PORT + "...");
-
             while (true) {
                 Socket clientSocket = serverSocket.accept();
                 System.out.println("New client connected from: " + clientSocket.getInetAddress());
@@ -40,150 +38,181 @@ public class Server {
 
     static class ClientHandler implements Runnable {
         private Socket socket;
-        private Map<String, String> openFiles = new HashMap<>(); // クライアントごとのオープンファイル管理
         private String clientId; // クライアント識別子
+        private BufferedReader reader;
+        private BufferedWriter writer;
 
         public ClientHandler(Socket socket) {
             this.socket = socket;
-            this.clientId = socket.getInetAddress().toString() + ":" + socket.getPort();
+            this.clientId = "名無し" + socket.getPort();
+            System.out.println("ClientHandler created for: " + clientId);
         }
 
         // ファイルを読み込むメソッド
         private String readFile(File file) throws IOException {
-            try (BufferedReader reader = new BufferedReader(new FileReader(file))) {
-                StringBuilder content = new StringBuilder();
+            System.out.println("Reading file: " + file.getAbsolutePath());
+            StringBuilder content = new StringBuilder();
+            try (BufferedReader fileReader = new BufferedReader(new InputStreamReader(new FileInputStream(file), StandardCharsets.UTF_8))) {
                 String line;
-                while ((line = reader.readLine()) != null) {
+                while ((line = fileReader.readLine()) != null) {
                     content.append(line).append("\n");
                 }
-                return content.toString().trim();
             }
+            return content.toString().trim();
         }
 
-        // ファイルに書き込むメソッド
+        // ファイルに書き込むメソッド（追記モード）
         private void writeFile(File file, String content) throws IOException {
+            System.out.println("Writing to file: " + file.getAbsolutePath());
             file.getParentFile().mkdirs();
-            try (BufferedWriter writer = new BufferedWriter(new FileWriter(file))) {
-                writer.write(content);
+            try (BufferedWriter fileWriter = new BufferedWriter(new OutputStreamWriter(new FileOutputStream(file, true), StandardCharsets.UTF_8))) {
+                fileWriter.write(content);
             }
         }
 
         @Override
         public void run() {
-            try (DataInputStream in = new DataInputStream(socket.getInputStream());
-                 DataOutputStream out = new DataOutputStream(socket.getOutputStream())) {
+            try {
+                reader = new BufferedReader(new InputStreamReader(socket.getInputStream(), StandardCharsets.UTF_8));
+                writer = new BufferedWriter(new OutputStreamWriter(socket.getOutputStream(), StandardCharsets.UTF_8));
+                System.out.println("Data streams initialized for: " + clientId);
 
                 while (true) {
-                    String command;
-                    try {
-                        command = in.readUTF();
-                    } catch (EOFException e) {
-                        // クライアントが接続を閉じた
+                    String command = reader.readLine();
+                    if (command == null) {
+                        System.out.println("Client " + clientId + " disconnected.");
                         break;
                     }
-
-                    String filePath = in.readUTF();
-
-                    if (filePath.startsWith("/")) {
-                        filePath = filePath.substring(1);
-                    }
-
-                    if (filePath.contains("..")) {
-                        out.writeUTF("ERROR:INVALID_FILE_PATH");
-                        continue;
-                    }
-
-                    File file = new File(STORAGE_DIR, filePath);
+                    System.out.println("Received command from " + clientId + ": " + command);
 
                     switch (command) {
-                        case "OPEN":
-                            String mode = in.readUTF();
-                            handleOpenCommand(file, filePath, mode, out);
+                        case "SEND_MESSAGE":
+                            String message = reader.readLine();
+                            handleSendMessage(message);
                             break;
-                        case "READ":
-                            handleReadCommand(filePath, out);
-                            break;
-                        case "WRITE":
-                            handleWriteCommand(filePath, in, out);
-                            break;
-                        case "CLOSE":
-                            String closeMode = in.readUTF();
-                            String content = in.readUTF();
-                            handleCloseCommand(filePath, closeMode, content, out);
+                        case "READ_CHAT":
+                            handleReadChat();
                             break;
                         default:
-                            out.writeUTF("ERROR:INVALID_COMMAND");
+                            System.err.println("Invalid command from " + clientId + ": " + command);
+                            writer.write("ERROR:INVALID_COMMAND\n");
+                            writer.flush();
                     }
                 }
 
             } catch (IOException e) {
+                System.err.println("IOException in ClientHandler for " + clientId + ": " + e.getMessage());
                 e.printStackTrace();
             } finally {
                 // クライアントが切断された場合、保持しているすべてのロックを解除
-                for (String filePath : openFiles.keySet()) {
-                    lockedFiles.remove(filePath, clientId);
-                }
                 try {
+                    if (reader != null) reader.close();
+                    if (writer != null) writer.close();
                     socket.close();
+                    System.out.println("Connection closed for " + clientId);
                 } catch (IOException e) {
-                    System.err.println("Error closing client socket: " + e.getMessage());
+                    System.err.println("Error closing client socket for " + clientId + ": " + e.getMessage());
                 }
             }
         }
 
-        private void handleOpenCommand(File file, String filePath, String mode, DataOutputStream out) throws IOException {
-            if (!mode.equals("READ_ONLY")) {
-                boolean lockAcquired = lockedFiles.putIfAbsent(filePath, clientId) == null;
-                if (!lockAcquired) {
-                    out.writeUTF("ERROR:FILE_ALREADY_LOCKED");
+        private void handleSendMessage(String message) throws IOException {
+            String chatFilePath = "chat.txt";
+            System.out.println("Handling SEND_MESSAGE for " + clientId + ": " + message);
+
+            // ロックを試みる（WRITE_ONLY）
+            boolean lockAcquired = lockedFiles.putIfAbsent(chatFilePath, clientId) == null;
+            if (!lockAcquired) {
+                String currentLockOwner = lockedFiles.get(chatFilePath);
+                if (currentLockOwner.equals(clientId)) {
+                    // 同一クライアントが既にロックを保持している場合は許可
+                    System.out.println("Chat file already locked by " + clientId + ". Proceeding to send message.");
+                } else {
+                    System.err.println("Chat file is locked by " + currentLockOwner);
+                    writer.write("ERROR:CHAT_FILE_LOCKED\n");
+                    writer.flush();
                     return;
                 }
             }
 
-            String content = "";
-            if (file.exists()) {
-                content = readFile(file);
-            }
+            try {
+                // メッセージにタイムスタンプとクライアントIDを付加
+                String timestamp = String.valueOf(System.currentTimeMillis());
+                String formattedMessage = timestamp + " [" + clientId + "]: " + message + "\n";
+                System.out.println("Formatted message: " + formattedMessage.trim());
 
-            openFiles.put(filePath, content);
-            out.writeUTF("OK");
-            out.writeUTF(content);
+                // chat.txtを追記
+                File chatFile = new File(STORAGE_DIR, chatFilePath);
+                writeFile(chatFile, formattedMessage);
+
+                writer.write("OK:MESSAGE_SENT\n");
+                writer.flush();
+                System.out.println("Message sent to chat: " + formattedMessage.trim());
+            } catch (IOException e) {
+                System.err.println("Failed to write message to chat.txt for " + clientId + ": " + e.getMessage());
+                writer.write("ERROR:FAILED_TO_WRITE_CHAT\n");
+                writer.flush();
+            } finally {
+                // ロックを解除
+                lockedFiles.remove(chatFilePath, clientId);
+                System.out.println("Chat file lock released by " + clientId);
+            }
         }
 
-        private void handleReadCommand(String filePath, DataOutputStream out) throws IOException {
-            if (!openFiles.containsKey(filePath)) {
-                out.writeUTF("ERROR:FILE_NOT_OPEN");
-                return;
+        private void handleReadChat() throws IOException {
+            String chatFilePath = "chat.txt";
+            System.out.println("Handling READ_CHAT for " + clientId);
+
+            // ロックを試みる（READ_ONLY）
+            boolean lockAcquired = lockedFiles.putIfAbsent(chatFilePath, clientId) == null;
+            if (!lockAcquired) {
+                String currentLockOwner = lockedFiles.get(chatFilePath);
+                if (currentLockOwner.equals(clientId)) {
+                    // 同一クライアントが既にロックを保持している場合は許可
+                    System.out.println("Chat file already locked by " + clientId + ". Proceeding to read chat.");
+                } else {
+                    System.err.println("Chat file is locked by " + currentLockOwner);
+                    writer.write("ERROR:CHAT_FILE_LOCKED\n");
+                    writer.flush();
+                    return;
+                }
             }
 
-            String content = openFiles.get(filePath);
-            out.writeUTF(content);
+            try {
+                // チャットファイルの内容を読み取る
+                File chatFile = new File(STORAGE_DIR, chatFilePath);
+                String chatContent = "";
+                if (chatFile.exists()) {
+                    chatContent = readFile(chatFile);
+                }
+
+                writer.write("OK\n");
+                writer.write(chatContent + "\n");
+                writer.flush();
+                System.out.println("Chat content sent to " + clientId);
+            } catch (IOException e) {
+                System.err.println("Failed to read chat.txt for " + clientId + ": " + e.getMessage());
+                writer.write("ERROR:FAILED_TO_READ_CHAT\n");
+                writer.flush();
+            } finally {
+                // ロックを解除
+                lockedFiles.remove(chatFilePath, clientId);
+                System.out.println("Chat file lock released by " + clientId);
+            }
         }
 
-        private void handleWriteCommand(String filePath, DataInputStream in, DataOutputStream out) throws IOException {
-            if (!openFiles.containsKey(filePath)) {
-                out.writeUTF("ERROR:FILE_NOT_OPEN");
-                return;
+        // 不適切な単語をフィルタリングするメソッド（削除可）
+        private boolean isValidMessage(String message) {
+            // この機能は削除するように指示されていますので、以下のコードはコメントアウトします。
+            /*
+            String[] bannedWords = {"おまんこ", "不適切な単語1", "不適切な単語2"};
+            for (String word : bannedWords) {
+                if (message.contains(word)) {
+                    return false;
+                }
             }
-
-            String newContent = in.readUTF();
-            openFiles.put(filePath, newContent);
-            out.writeUTF("OK");
-        }
-
-        private void handleCloseCommand(String filePath, String mode, String content, DataOutputStream out) throws IOException {
-            if (!openFiles.containsKey(filePath)) {
-                out.writeUTF("ERROR:FILE_NOT_OPEN");
-                return;
-            }
-
-            if (!mode.equals("READ_ONLY")) {
-                writeFile(new File(STORAGE_DIR, filePath), content);
-                lockedFiles.remove(filePath, clientId);
-            }
-
-            openFiles.remove(filePath);
-            out.writeUTF("OK");
+            */
+            return true; // 全てのメッセージを許可
         }
     }
 }

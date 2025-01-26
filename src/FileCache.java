@@ -26,7 +26,7 @@ public class FileCache {
     }
 
     public String read(String filePath) {
-       return cache.get(filePath);
+        return cache.get(filePath);
     }
 
     public void write(String filePath, String content) {
