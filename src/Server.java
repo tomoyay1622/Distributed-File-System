@@ -11,13 +11,14 @@ public class Server {
     static class FileAccessInfo {
         String mode;
         ReentrantReadWriteLock lock;
+        boolean isLocked;
 
         public FileAccessInfo(String mode) {
             this.mode = mode;
             this.lock = new ReentrantReadWriteLock();
+            this.isLocked = false;
         }
     }
-
 
     public static void main(String[] args) {
         try (ServerSocket serverSocket = new ServerSocket(PORT)) {
@@ -34,9 +35,31 @@ public class Server {
 
     static class ClientHandler implements Runnable {
         private Socket socket;
+        private static final String STORAGE_DIR = "server_storage"; // ストレージディレクトリの定義
 
         public ClientHandler(Socket socket) {
             this.socket = socket;
+        }
+
+        // ファイルを読み込むメソッド
+        private String readFile(File file) throws IOException {
+            try (BufferedReader reader = new BufferedReader(new FileReader(file))) {
+                StringBuilder content = new StringBuilder();
+                String line;
+                while ((line = reader.readLine()) != null) {
+                    content.append(line).append("\n");
+                }
+                return content.toString().trim();
+            }
+        }
+
+        // ファイルに書き込むメソッド（必要なら作成）
+        private void writeFile(File file, String content) throws IOException {
+            // 必要に応じてディレクトリを作成
+            file.getParentFile().mkdirs();
+            try (BufferedWriter writer = new BufferedWriter(new FileWriter(file))) {
+                writer.write(content);
+            }
         }
 
         @Override
@@ -46,11 +69,12 @@ public class Server {
 
                 String command = in.readUTF();
                 String filePath = in.readUTF();
+                File file = new File(STORAGE_DIR, filePath); // ファイルパスをserver_storageに設定
 
                 switch (command) {
                     case "OPEN":
                         String mode = in.readUTF();
-                        handleOpenCommand(filePath, mode, out);
+                        handleOpenCommand(file, filePath, mode, out);
                         break;
                     case "READ":
                         handleReadCommand(filePath, out);
@@ -72,9 +96,10 @@ public class Server {
             }
         }
 
-        private void handleOpenCommand(String filePath, String mode, DataOutputStream out) throws IOException {
+        private void handleOpenCommand(File file, String filePath, String mode, DataOutputStream out) throws IOException {
             FileAccessInfo accessInfo = fileAccessInfoMap.computeIfAbsent(filePath, k -> new FileAccessInfo(mode));
             accessInfo.lock.readLock().lock(); // open は read lock で保護 (排他制御)
+            accessInfo.isLocked = true; // ロック状態を更新
             try {
                 if (accessInfo.mode == null) {
                     accessInfo.mode = mode; // 初めて open される場合はモードを設定
@@ -85,13 +110,16 @@ public class Server {
 
                 System.out.println("OPEN request for file: " + filePath + " in mode: " + mode);
                 String content = fileStore.getOrDefault(filePath, "");
+                if (content.isEmpty() && file.exists()) {
+                    content = readFile(file); // ファイルから内容を読み込む
+                    fileStore.put(filePath, content); // キャッシュに保存
+                }
                 out.writeUTF("OK"); // 成功応答を送信
                 out.writeUTF(content);
             } finally {
-                accessInfo.lock.readLock().unlock();
+                // accessInfo.lock.readLock().unlock(); // ここではロックを解除しない
             }
         }
-
 
          private void handleReadCommand(String filePath, DataOutputStream out) throws IOException {
             FileAccessInfo accessInfo = fileAccessInfoMap.get(filePath);
@@ -148,14 +176,25 @@ public class Server {
                  return;
             }
 
-            accessInfo.lock.writeLock().lock(); // close は write lock で排他制御
+            // read lockを解除する
+            if (accessInfo.isLocked) {
+                try {
+                    accessInfo.lock.readLock().unlock(); // close時にread lockを解除
+                } catch (IllegalMonitorStateException e) {
+                    System.err.println("Error unlocking read lock: " + e.getMessage());
+                }
+                accessInfo.isLocked = false; // ロック状態を更新
+            }
+
+            // accessInfo.lock.writeLock().lock(); // close は write lock で排他制御
             try {
                 System.out.println("CLOSE request for file: " + filePath + ", mode: " + mode);
                 fileStore.put(filePath, content); // キャッシュされた内容でサーバーのファイルストアを更新
+                writeFile(new File(STORAGE_DIR, filePath), content); // ファイルに書き込む
                 fileAccessInfoMap.remove(filePath); // ファイルアクセス情報を削除
                 out.writeUTF("OK");
             } finally {
-                accessInfo.lock.writeLock().unlock();
+                // accessInfo.lock.writeLock().unlock();
             }
         }
     }

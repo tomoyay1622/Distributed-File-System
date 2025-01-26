@@ -3,6 +3,13 @@
   "configurations": [
     {
       "type": "java",
+      "name": "Client",
+      "request": "launch",
+      "mainClass": "Client",
+      "projectName": "Distributed-File-System_baaf680e"
+    },
+    {
+      "type": "java",
       "name": "Server",
       "request": "launch",
       "mainClass": "Server",
