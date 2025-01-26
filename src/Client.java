@@ -163,7 +163,6 @@ public class Client {
 
         String response = reader.readLine();
         if (response.equals("OK")) {
-            String content = reader.readLine();
             return "OK";
         } else {
             return response;
@@ -198,12 +197,11 @@ public class Client {
 
     // CLOSE コマンドの送信
     public String close(String filePath) throws IOException {
-        // モードを指定する必要があります。ここでは単純化のため READ_WRITE と仮定します
-        String mode = "READ_WRITE"; // 実際にはファイルを開いた時のモードを追跡する必要があります
+        String mode = "READ_WRITE";
         writer.write("CLOSE\n");
         writer.write(filePath + "\n");
         writer.write(mode + "\n");
-        writer.write("\n"); // 内容を送信（必要に応じて）
+        writer.write("\n");
         writer.flush();
 
         String response = reader.readLine();
