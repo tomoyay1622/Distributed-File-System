@@ -1,44 +1,51 @@
+// Server.java
 import java.io.*;
 import java.net.*;
+import java.util.HashMap;
+import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.locks.ReentrantReadWriteLock;
 
 public class Server {
     private static final int PORT = 12345;
-    private static final ConcurrentHashMap<String, String> fileStore = new ConcurrentHashMap<>();
-    private static final ConcurrentHashMap<String, FileAccessInfo> fileAccessInfoMap = new ConcurrentHashMap<>();
+    private static final String STORAGE_DIR = "server_storage"; // ストレージディレクトリの定義
 
-    static class FileAccessInfo {
-        String mode;
-        ReentrantReadWriteLock lock;
-        boolean isLocked;
-
-        public FileAccessInfo(String mode) {
-            this.mode = mode;
-            this.lock = new ReentrantReadWriteLock();
-            this.isLocked = false;
-        }
-    }
+    // ファイルロックを管理するマップ (ファイルパス -> クライアント識別子)
+    private static final ConcurrentHashMap<String, String> lockedFiles = new ConcurrentHashMap<>();
 
     public static void main(String[] args) {
+        // ストレージディレクトリが存在しない場合は作成
+        File storageDir = new File(STORAGE_DIR);
+        if (!storageDir.exists()) {
+            if (storageDir.mkdirs()) {
+                System.out.println("Storage directory created at: " + storageDir.getAbsolutePath());
+            } else {
+                System.err.println("Failed to create storage directory at: " + storageDir.getAbsolutePath());
+                return;
+            }
+        }
+
         try (ServerSocket serverSocket = new ServerSocket(PORT)) {
-            System.out.println("Server is running...");
+            System.out.println("Server is running on port " + PORT + "...");
 
             while (true) {
                 Socket clientSocket = serverSocket.accept();
+                System.out.println("New client connected from: " + clientSocket.getInetAddress());
                 new Thread(new ClientHandler(clientSocket)).start();
             }
         } catch (IOException e) {
             e.printStackTrace();
+            System.err.println("Server exception: " + e.getMessage());
         }
     }
 
     static class ClientHandler implements Runnable {
         private Socket socket;
-        private static final String STORAGE_DIR = "server_storage"; // ストレージディレクトリの定義
+        private Map<String, String> openFiles = new HashMap<>(); // クライアントごとのオープンファイル管理
+        private String clientId; // クライアント識別子
 
         public ClientHandler(Socket socket) {
             this.socket = socket;
+            this.clientId = socket.getInetAddress().toString() + ":" + socket.getPort();
         }
 
         // ファイルを読み込むメソッド
@@ -53,7 +60,7 @@ public class Server {
             }
         }
 
-        // ファイルに書き込むメソッド（必要なら作成）
+        // ファイルに書き込むメソッド
         private void writeFile(File file, String content) throws IOException {
             // 必要に応じてディレクトリを作成
             file.getParentFile().mkdirs();
@@ -67,135 +74,155 @@ public class Server {
             try (DataInputStream in = new DataInputStream(socket.getInputStream());
                  DataOutputStream out = new DataOutputStream(socket.getOutputStream())) {
 
-                String command = in.readUTF();
-                String filePath = in.readUTF();
-                File file = new File(STORAGE_DIR, filePath); // ファイルパスをserver_storageに設定
+                while (true) {
+                    String command;
+                    try {
+                        command = in.readUTF();
+                    } catch (EOFException e) {
+                        // クライアントが接続を閉じた
+                        break;
+                    }
 
-                switch (command) {
-                    case "OPEN":
-                        String mode = in.readUTF();
-                        handleOpenCommand(file, filePath, mode, out);
-                        break;
-                    case "READ":
-                        handleReadCommand(filePath, out);
-                        break;
-                    case "WRITE":
-                        handleWriteCommand(filePath, in, out);
-                        break;
-                    case "CLOSE":
-                        String closeMode = in.readUTF(); // close時のmodeを受信 (念のため)
-                        String content = in.readUTF();
-                        handleCloseCommand(filePath, closeMode, content, out);
-                        break;
-                    default:
-                        out.writeUTF("ERROR:INVALID_COMMAND");
+                    String filePath = in.readUTF();
+
+                    // ファイルパスの正規化: 先頭のスラッシュを削除
+                    if (filePath.startsWith("/")) {
+                        filePath = filePath.substring(1);
+                    }
+
+                    // 不正なパスを防ぐために、パス内に ".." が含まれていないか確認
+                    if (filePath.contains("..")) {
+                        out.writeUTF("ERROR:INVALID_FILE_PATH");
+                        System.err.println("Invalid file path attempted: " + filePath);
+                        continue;
+                    }
+
+                    File file = new File(STORAGE_DIR, filePath); // ファイルパスをserver_storageに設定
+
+                    switch (command) {
+                        case "OPEN":
+                            String mode = in.readUTF();
+                            handleOpenCommand(file, filePath, mode, out);
+                            break;
+                        case "READ":
+                            handleReadCommand(filePath, out);
+                            break;
+                        case "WRITE":
+                            handleWriteCommand(filePath, in, out);
+                            break;
+                        case "CLOSE":
+                            String closeMode = in.readUTF(); // close時のmodeを受信
+                            String content = in.readUTF();
+                            handleCloseCommand(filePath, closeMode, content, out);
+                            break;
+                        default:
+                            out.writeUTF("ERROR:INVALID_COMMAND");
+                            System.err.println("Invalid command received: " + command);
+                    }
                 }
+
             } catch (IOException e) {
                 e.printStackTrace();
-                System.err.println("Client handler exception: " + e.getMessage()); // サーバー側のエラーログ
+                System.err.println("Client handler exception: " + e.getMessage());
+            } finally {
+                // クライアントが切断された場合、保持しているすべてのロックを解除
+                for (String filePath : openFiles.keySet()) {
+                    lockedFiles.remove(filePath, clientId);
+                    System.out.println("Lock released for file: " + filePath + " due to client disconnect.");
+                }
+                try {
+                    socket.close();
+                    System.out.println("Client disconnected.");
+                } catch (IOException e) {
+                    System.err.println("Error closing client socket: " + e.getMessage());
+                }
             }
         }
 
         private void handleOpenCommand(File file, String filePath, String mode, DataOutputStream out) throws IOException {
-            FileAccessInfo accessInfo = fileAccessInfoMap.computeIfAbsent(filePath, k -> new FileAccessInfo(mode));
-            accessInfo.lock.readLock().lock(); // open は read lock で保護 (排他制御)
-            accessInfo.isLocked = true; // ロック状態を更新
-            try {
-                if (accessInfo.mode == null) {
-                    accessInfo.mode = mode; // 初めて open される場合はモードを設定
-                } else if (!accessInfo.mode.equals(mode)) {
-                    out.writeUTF("ERROR:ALREADY_OPEN_IN_DIFFERENT_MODE");
+            // ロックを取得
+            boolean lockAcquired = lockedFiles.putIfAbsent(filePath, clientId) == null;
+            if (!lockAcquired) {
+                out.writeUTF("ERROR:FILE_ALREADY_LOCKED");
+                System.err.println("File already locked by another client: " + filePath);
+                return;
+            }
+
+            if (openFiles.containsKey(filePath)) {
+                out.writeUTF("ERROR:FILE_ALREADY_OPEN");
+                System.err.println("File already open by this client: " + filePath);
+                // 既にロックを取得している場合は再度ロックを取得する必要はない
+                return;
+            }
+
+            String content = "";
+            if (file.exists()) {
+                try {
+                    content = readFile(file);
+                    System.out.println("File content loaded from disk: " + content);
+                } catch (IOException e) {
+                    out.writeUTF("ERROR:FAILED_TO_READ_FILE");
+                    System.err.println("Failed to read file: " + filePath + " - " + e.getMessage());
+                    // ロックを解除
+                    lockedFiles.remove(filePath, clientId);
                     return;
                 }
-
-                System.out.println("OPEN request for file: " + filePath + " in mode: " + mode);
-                String content = fileStore.getOrDefault(filePath, "");
-                if (content.isEmpty() && file.exists()) {
-                    content = readFile(file); // ファイルから内容を読み込む
-                    fileStore.put(filePath, content); // キャッシュに保存
-                }
-                out.writeUTF("OK"); // 成功応答を送信
-                out.writeUTF(content);
-            } finally {
-                // accessInfo.lock.readLock().unlock(); // ここではロックを解除しない
             }
+
+            openFiles.put(filePath, content);
+            System.out.println("OPEN request for file: " + filePath + " in mode: " + mode);
+            out.writeUTF("OK");
+            out.writeUTF(content);
         }
 
-         private void handleReadCommand(String filePath, DataOutputStream out) throws IOException {
-            FileAccessInfo accessInfo = fileAccessInfoMap.get(filePath);
-            if (accessInfo == null || accessInfo.mode == null) {
+        private void handleReadCommand(String filePath, DataOutputStream out) throws IOException {
+            if (!openFiles.containsKey(filePath)) {
                 out.writeUTF("ERROR:FILE_NOT_OPEN");
-                return;
-            }
-            if (!accessInfo.mode.equals("READ_ONLY") && !accessInfo.mode.equals("READ_WRITE")) {
-                out.writeUTF("ERROR:INCORRECT_MODE_FOR_READ");
+                System.err.println("READ failed: File not open - " + filePath);
                 return;
             }
 
-             accessInfo.lock.readLock().lock();
-            try {
-                System.out.println("READ request for file: " + filePath);
-                String content = fileStore.getOrDefault(filePath, "");
-                System.out.println("Sending content: " + content);
-                out.writeUTF(content);
-            } finally {
-                 accessInfo.lock.readLock().unlock();
-            }
+            String content = openFiles.get(filePath);
+            System.out.println("READ request for file: " + filePath);
+            out.writeUTF(content);
         }
 
-         private void handleWriteCommand(String filePath, DataInputStream in, DataOutputStream out) throws IOException {
-            FileAccessInfo accessInfo = fileAccessInfoMap.get(filePath);
-             if (accessInfo == null || accessInfo.mode == null) {
+        private void handleWriteCommand(String filePath, DataInputStream in, DataOutputStream out) throws IOException {
+            if (!openFiles.containsKey(filePath)) {
                 out.writeUTF("ERROR:FILE_NOT_OPEN");
-                return;
-            }
-            if (!accessInfo.mode.equals("WRITE_ONLY") && !accessInfo.mode.equals("READ_WRITE")) {
-                out.writeUTF("ERROR:INCORRECT_MODE_FOR_WRITE");
+                System.err.println("WRITE failed: File not open - " + filePath);
                 return;
             }
 
-              accessInfo.lock.writeLock().lock();
-              try {
-                    String newContent = in.readUTF();
-                    System.out.println("WRITE request for file: " + filePath + ", content: " + newContent);
-                    fileStore.put(filePath, newContent);
-                    out.writeUTF("OK");
-               } finally {
-                   accessInfo.lock.writeLock().unlock();
-               }
+            String newContent = in.readUTF();
+            openFiles.put(filePath, newContent);
+            System.out.println("WRITE request for file: " + filePath + ", content: " + newContent);
+            out.writeUTF("OK");
         }
 
         private void handleCloseCommand(String filePath, String mode, String content, DataOutputStream out) throws IOException {
-            FileAccessInfo accessInfo = fileAccessInfoMap.get(filePath);
-            if (accessInfo == null || accessInfo.mode == null) {
+            if (!openFiles.containsKey(filePath)) {
                 out.writeUTF("ERROR:FILE_NOT_OPEN");
+                System.err.println("CLOSE failed: File not open - " + filePath);
                 return;
             }
-            if (!accessInfo.mode.equals(mode)) { // 念のため mode の整合性チェック
-                 out.writeUTF("ERROR:MODE_MISMATCH_ON_CLOSE");
-                 return;
-            }
 
-            // read lockを解除する
-            if (accessInfo.isLocked) {
-                try {
-                    accessInfo.lock.readLock().unlock(); // close時にread lockを解除
-                } catch (IllegalMonitorStateException e) {
-                    System.err.println("Error unlocking read lock: " + e.getMessage());
-                }
-                accessInfo.isLocked = false; // ロック状態を更新
-            }
-
-            // accessInfo.lock.writeLock().lock(); // close は write lock で排他制御
+            openFiles.put(filePath, content);
+            System.out.println("CLOSE request for file: " + filePath + ", mode: " + mode);
             try {
-                System.out.println("CLOSE request for file: " + filePath + ", mode: " + mode);
-                fileStore.put(filePath, content); // キャッシュされた内容でサーバーのファイルストアを更新
-                writeFile(new File(STORAGE_DIR, filePath), content); // ファイルに書き込む
-                fileAccessInfoMap.remove(filePath); // ファイルアクセス情報を削除
-                out.writeUTF("OK");
-            } finally {
-                // accessInfo.lock.writeLock().unlock();
+                writeFile(new File(STORAGE_DIR, filePath), content);
+                System.out.println("File written to disk: " + content);
+            } catch (IOException e) {
+                out.writeUTF("ERROR:FAILED_TO_WRITE_FILE");
+                System.err.println("Failed to write file: " + filePath + " - " + e.getMessage());
+                return;
             }
+
+            openFiles.remove(filePath);
+            // ロックを解除
+            lockedFiles.remove(filePath, clientId);
+            System.out.println("File closed and lock released: " + filePath);
+            out.writeUTF("OK");
         }
     }
 }

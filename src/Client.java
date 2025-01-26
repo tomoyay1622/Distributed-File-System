@@ -1,4 +1,4 @@
-
+// Client.java
 import java.io.*;
 import java.net.*;
 import java.util.Scanner;
@@ -8,10 +8,41 @@ public class Client {
     private static final int PORT = 12345;
     private FileCache cache = new FileCache();
     private Scanner scanner = new Scanner(System.in);
+    private Socket socket;
+    private DataOutputStream out;
+    private DataInputStream in;
 
     public static void main(String[] args) {
         Client client = new Client();
-        client.run();
+        try {
+            client.connect();
+            client.run();
+        } catch (IOException e) {
+            System.out.println("サーバーへの接続に失敗しました: " + e.getMessage());
+            e.printStackTrace();
+        } finally {
+            client.closeConnection();
+        }
+    }
+
+    // サーバーに接続
+    public void connect() throws IOException {
+        socket = new Socket(SERVER_ADDRESS, PORT);
+        out = new DataOutputStream(socket.getOutputStream());
+        in = new DataInputStream(socket.getInputStream());
+        System.out.println("サーバーに接続しました。");
+    }
+
+    // 接続を閉じる
+    public void closeConnection() {
+        try {
+            if (out != null) out.close();
+            if (in != null) in.close();
+            if (socket != null) socket.close();
+            System.out.println("サーバーとの接続を閉じました。");
+        } catch (IOException e) {
+            System.err.println("接続を閉じる際にエラーが発生しました: " + e.getMessage());
+        }
     }
 
     public void run() {
@@ -97,7 +128,6 @@ public class Client {
                         break;
                     case "exit":
                         System.out.println("クライアントを終了します。");
-                        scanner.close();
                         return;
                     default:
                         System.out.println("無効なコマンドです。");
@@ -109,55 +139,60 @@ public class Client {
         }
     }
 
+    // Client.java の open メソッド内
     public String open(String filePath, String mode) throws IOException {
-        String content = "";
-         if (!cache.isCached(filePath)) {
-            try (Socket socket = new Socket(SERVER_ADDRESS, PORT);
-                 DataOutputStream out = new DataOutputStream(socket.getOutputStream());
-                 DataInputStream in = new DataInputStream(socket.getInputStream())) {
-                out.writeUTF("OPEN"); // コマンドを OPEN に変更
-                out.writeUTF(filePath);
-                out.writeUTF(mode); // モードを送信
-                String response = in.readUTF(); // サーバーからの応答を受信
-                if (response.startsWith("ERROR:")) {
-                    return response; // エラー応答をそのまま返す
-                }
-                content = in.readUTF(); // ファイル内容を受信
-                cache.cacheFile(filePath, content);
-            } catch (IOException e) {
-                return "ERROR:" + e.getMessage(); // 例外発生時のエラー応答
-            }
+        out.writeUTF("OPEN");
+        out.writeUTF(filePath);
+        out.writeUTF(mode);
+        String response = in.readUTF();
+        if (response.startsWith("ERROR:")) {
+            return response;
         }
+        String content = in.readUTF();
+        cache.cacheFile(filePath, content);
         cache.setFileMode(filePath, mode);
-        return "OK"; // 成功応答
+        return "OK";
     }
 
 
-    public String read(String filePath) {
-        return cache.read(filePath);
+    public String read(String filePath) throws IOException {
+        out.writeUTF("READ");
+        out.writeUTF(filePath);
+        String response = in.readUTF();
+        if (response.startsWith("ERROR:")) {
+            return null;
+        }
+        return response;
     }
 
-    public void write(String filePath, String content) {
-        cache.write(filePath, content);
+    public void write(String filePath, String content) throws IOException {
+        out.writeUTF("WRITE");
+        out.writeUTF(filePath);
+        out.writeUTF(content);
+        String response = in.readUTF();
+        if (response.startsWith("ERROR:")) {
+            System.out.println("エラー: " + response.substring(6));
+        } else {
+            // キャッシュを更新する
+            cache.write(filePath, content);
+        }
     }
 
     public String close(String filePath) throws IOException {
-        if (cache.isModified(filePath)) {
-            try (Socket socket = new Socket(SERVER_ADDRESS, PORT);
-                 DataOutputStream out = new DataOutputStream(socket.getOutputStream());
-                 DataInputStream in = new DataInputStream(socket.getInputStream())) {
-                out.writeUTF("CLOSE"); // コマンドを CLOSE に変更
-                out.writeUTF(filePath);
-                out.writeUTF(cache.getFileMode(filePath)); // モードを送信
-                out.writeUTF(cache.read(filePath));
-                String response = in.readUTF(); // サーバーからの応答を受信
-                return response; // サーバーからの応答をそのまま返す
-            } catch (IOException e) {
-                return "ERROR:" + e.getMessage(); // 例外発生時のエラー応答
-            }
-        } else {
-            cache.remove(filePath);
-            return "OK"; // 変更がない場合は成功応答
+        out.writeUTF("CLOSE");
+        out.writeUTF(filePath);
+        String mode = cache.getFileMode(filePath);
+        if (mode == null) {
+            return "ERROR:FILE_NOT_OPEN";
         }
+        out.writeUTF(mode);
+        String content = cache.read(filePath);
+        out.writeUTF(content != null ? content : "");
+        String response = in.readUTF();
+        if (response.startsWith("ERROR:")) {
+            return response;
+        }
+        cache.remove(filePath);
+        return "OK";
     }
 }

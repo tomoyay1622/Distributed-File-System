@@ -1,3 +1,4 @@
+// FileCache.java
 import java.util.HashMap;
 import java.util.Map;
 
@@ -11,7 +12,6 @@ public class FileCache {
         cache.put(filePath, content);
         modified.put(filePath, false);
     }
-
 
     public boolean isCached(String filePath) {
         return cache.containsKey(filePath);
