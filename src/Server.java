@@ -3,6 +3,7 @@ import java.io.*;
 import java.net.*;
 import java.nio.charset.StandardCharsets;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.regex.Pattern;
 
 public class Server {
     private static final int PORT = 12345;
@@ -64,10 +65,24 @@ public class Server {
         // ファイルに書き込むメソッド（追記モード）
         private void writeFile(File file, String content) throws IOException {
             System.out.println("Writing to file: " + file.getAbsolutePath());
-            file.getParentFile().mkdirs();
+            file.getParentFile().mkdirs(); // ディレクトリが存在しない場合は作成
             try (BufferedWriter fileWriter = new BufferedWriter(new OutputStreamWriter(new FileOutputStream(file, true), StandardCharsets.UTF_8))) {
                 fileWriter.write(content);
             }
+        }
+
+        // 不適切な単語をフィルタリングするメソッド
+        private boolean isValidMessage(String message) {
+            String[] bannedWords = {"fuck", "shit", "bitch"};
+            String lowerCaseMessage = message.toLowerCase(); // メッセージを小文字に変換
+            for (String word : bannedWords) {
+                // 正規表現で単語単位の一致をチェック
+                Pattern pattern = Pattern.compile("\\b" + Pattern.quote(word) + "\\b");
+                if (pattern.matcher(lowerCaseMessage).find()) {
+                    return false;
+                }
+            }
+            return true; // 全てのメッセージを許可
         }
 
         @Override
@@ -78,7 +93,7 @@ public class Server {
                 System.out.println("Data streams initialized for: " + clientId);
 
                 while (true) {
-                    String command = reader.readLine();
+                    String command = reader.readLine(); // コマンドを受信
                     if (command == null) {
                         System.out.println("Client " + clientId + " disconnected.");
                         break;
@@ -86,12 +101,12 @@ public class Server {
                     System.out.println("Received command from " + clientId + ": " + command);
 
                     switch (command) {
-                        case "SEND_MESSAGE":
-                            String message = reader.readLine();
-                            handleSendMessage(message);
+                        case "SEND_MESSAGE": // メッセージ送信コマンド
+                            String message = reader.readLine(); // メッセージを受信
+                            handleSendMessage(message); // メッセージ処理
                             break;
                         case "READ_CHAT":
-                            handleReadChat();
+                            handleReadChat(); // チャット履歴の処理
                             break;
                         default:
                             System.err.println("Invalid command from " + clientId + ": " + command);
@@ -117,17 +132,23 @@ public class Server {
         }
 
         private void handleSendMessage(String message) throws IOException {
-            String chatFilePath = "chat.txt";
+            String chatFilePath = "chat.txt"; // 対象ファイル
             System.out.println("Handling SEND_MESSAGE for " + clientId + ": " + message);
 
-            // ロックを試みる（WRITE_ONLY）
+            // メッセージのバリデーション
+            if (!isValidMessage(message)) {
+                writer.write("ERROR:INVALID_MESSAGE\n");
+                writer.flush();
+                System.out.println("Invalid message from " + clientId + ": " + message);
+                return;
+            }
+
+            // ロックの取得
             boolean lockAcquired = lockedFiles.putIfAbsent(chatFilePath, clientId) == null;
             if (!lockAcquired) {
                 String currentLockOwner = lockedFiles.get(chatFilePath);
-                if (currentLockOwner.equals(clientId)) {
-                    // 同一クライアントが既にロックを保持している場合は許可
-                    System.out.println("Chat file already locked by " + clientId + ". Proceeding to send message.");
-                } else {
+                if (!currentLockOwner.equals(clientId)) {
+                    // 他のクライアントがロックを保持している場合
                     System.err.println("Chat file is locked by " + currentLockOwner);
                     writer.write("ERROR:CHAT_FILE_LOCKED\n");
                     writer.flush();
@@ -136,12 +157,11 @@ public class Server {
             }
 
             try {
-                // メッセージにタイムスタンプとクライアントIDを付加
+                // メッセージにタイムスタンプとクライアントIDを追加
                 String timestamp = String.valueOf(System.currentTimeMillis());
                 String formattedMessage = timestamp + " [" + clientId + "]: " + message + "\n";
-                System.out.println("Formatted message: " + formattedMessage.trim());
 
-                // chat.txtを追記
+                // chat.txt に追記
                 File chatFile = new File(STORAGE_DIR, chatFilePath);
                 writeFile(chatFile, formattedMessage);
 
@@ -153,24 +173,22 @@ public class Server {
                 writer.write("ERROR:FAILED_TO_WRITE_CHAT\n");
                 writer.flush();
             } finally {
-                // ロックを解除
+                // ロック解除
                 lockedFiles.remove(chatFilePath, clientId);
                 System.out.println("Chat file lock released by " + clientId);
             }
         }
 
         private void handleReadChat() throws IOException {
-            String chatFilePath = "chat.txt";
+            String chatFilePath = "chat.txt"; // 対象ファイル
             System.out.println("Handling READ_CHAT for " + clientId);
 
-            // ロックを試みる（READ_ONLY）
+            // ロックの取得
             boolean lockAcquired = lockedFiles.putIfAbsent(chatFilePath, clientId) == null;
             if (!lockAcquired) {
                 String currentLockOwner = lockedFiles.get(chatFilePath);
-                if (currentLockOwner.equals(clientId)) {
-                    // 同一クライアントが既にロックを保持している場合は許可
-                    System.out.println("Chat file already locked by " + clientId + ". Proceeding to read chat.");
-                } else {
+                if (!currentLockOwner.equals(clientId)) {
+                    // 他のクライアントがロックを保持している場合
                     System.err.println("Chat file is locked by " + currentLockOwner);
                     writer.write("ERROR:CHAT_FILE_LOCKED\n");
                     writer.flush();
@@ -195,24 +213,10 @@ public class Server {
                 writer.write("ERROR:FAILED_TO_READ_CHAT\n");
                 writer.flush();
             } finally {
-                // ロックを解除
+                // ロック解除
                 lockedFiles.remove(chatFilePath, clientId);
                 System.out.println("Chat file lock released by " + clientId);
             }
-        }
-
-        // 不適切な単語をフィルタリングするメソッド（削除可）
-        private boolean isValidMessage(String message) {
-            // この機能は削除するように指示されていますので、以下のコードはコメントアウトします。
-            /*
-            String[] bannedWords = {"おまんこ", "不適切な単語1", "不適切な単語2"};
-            for (String word : bannedWords) {
-                if (message.contains(word)) {
-                    return false;
-                }
-            }
-            */
-            return true; // 全てのメッセージを許可
         }
     }
 }
