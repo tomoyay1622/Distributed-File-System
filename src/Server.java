@@ -2,6 +2,8 @@
 import java.io.*;
 import java.net.*;
 import java.nio.charset.StandardCharsets;
+import java.util.HashMap;
+import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.regex.Pattern;
 
@@ -26,6 +28,7 @@ public class Server {
 
         try (ServerSocket serverSocket = new ServerSocket(PORT)) {
             System.out.println("Server is running on port " + PORT + "...");
+
             while (true) {
                 Socket clientSocket = serverSocket.accept();
                 System.out.println("New client connected from: " + clientSocket.getInetAddress());
@@ -39,13 +42,14 @@ public class Server {
 
     static class ClientHandler implements Runnable {
         private Socket socket;
+        private Map<String, String> openFiles = new HashMap<>(); // クライアントごとのオープンファイル管理
         private String clientId; // クライアント識別子
         private BufferedReader reader;
         private BufferedWriter writer;
 
         public ClientHandler(Socket socket) {
             this.socket = socket;
-            this.clientId = "名無し" + socket.getPort();
+            this.clientId = socket.getInetAddress().toString() + ":" + socket.getPort();
             System.out.println("ClientHandler created for: " + clientId);
         }
 
@@ -101,12 +105,32 @@ public class Server {
                     System.out.println("Received command from " + clientId + ": " + command);
 
                     switch (command) {
-                        case "SEND_MESSAGE": // メッセージ送信コマンド
-                            String message = reader.readLine(); // メッセージを受信
-                            handleSendMessage(message); // メッセージ処理
+                        case "OPEN":
+                            String filePath = reader.readLine();
+                            String mode = reader.readLine();
+                            handleOpenCommand(filePath, mode, writer);
+                            break;
+                        case "READ":
+                            String readPath = reader.readLine();
+                            handleReadCommand(readPath, writer);
+                            break;
+                        case "WRITE":
+                            String writePath = reader.readLine();
+                            String newContent = reader.readLine();
+                            handleWriteCommand(writePath, newContent, writer);
+                            break;
+                        case "CLOSE":
+                            String closePath = reader.readLine();
+                            String closeMode = reader.readLine();
+                            String content = reader.readLine();
+                            handleCloseCommand(closePath, closeMode, content, writer);
+                            break;
+                        case "SEND_MESSAGE":
+                            String message = reader.readLine();
+                            handleSendMessage(message, writer);
                             break;
                         case "READ_CHAT":
-                            handleReadChat(); // チャット履歴の処理
+                            handleReadChat(writer);
                             break;
                         default:
                             System.err.println("Invalid command from " + clientId + ": " + command);
@@ -120,6 +144,9 @@ public class Server {
                 e.printStackTrace();
             } finally {
                 // クライアントが切断された場合、保持しているすべてのロックを解除
+                for (String filePath : openFiles.keySet()) {
+                    lockedFiles.remove(filePath, clientId);
+                }
                 try {
                     if (reader != null) reader.close();
                     if (writer != null) writer.close();
@@ -131,14 +158,140 @@ public class Server {
             }
         }
 
-        private void handleSendMessage(String message) throws IOException {
-            String chatFilePath = "chat.txt"; // 対象ファイル
+        // OPEN コマンドの処理
+        private void handleOpenCommand(String filePath, String mode, BufferedWriter out) throws IOException {
+            System.out.println("Handling OPEN for " + clientId + ": " + filePath + " in mode " + mode);
+
+            if (!mode.equals("READ_ONLY") && !mode.equals("WRITE_ONLY") && !mode.equals("READ_WRITE")) {
+                out.write("ERROR:INVALID_MODE\n");
+                out.flush();
+                return;
+            }
+
+            if (!mode.equals("READ_ONLY")) {
+                // 書き込みまたは読み書きモードの場合、ロックを取得
+                boolean lockAcquired = lockedFiles.putIfAbsent(filePath, clientId) == null;
+                if (!lockAcquired) {
+                    String currentLockOwner = lockedFiles.get(filePath);
+                    if (!currentLockOwner.equals(clientId)) {
+                        // 他のクライアントがロックを保持している場合
+                        out.write("ERROR:FILE_ALREADY_LOCKED\n");
+                        out.flush();
+                        System.err.println("File " + filePath + " is already locked by " + currentLockOwner);
+                        return;
+                    }
+                }
+            }
+
+            File file = new File(STORAGE_DIR, filePath);
+            String content = "";
+            if (file.exists()) {
+                content = readFile(file);
+            }
+
+            openFiles.put(filePath, mode); // ファイルを開いた状態を記録
+            out.write("OK\n");
+            out.write(content + "\n");
+            out.flush();
+            System.out.println("File " + filePath + " opened by " + clientId + " in mode " + mode);
+        }
+
+        // READ コマンドの処理
+        private void handleReadCommand(String filePath, BufferedWriter out) throws IOException {
+            System.out.println("Handling READ for " + clientId + ": " + filePath);
+
+            if (!openFiles.containsKey(filePath)) {
+                out.write("ERROR:FILE_NOT_OPEN\n");
+                out.flush();
+                return;
+            }
+
+            String mode = openFiles.get(filePath);
+            if (!mode.equals("READ_ONLY") && !mode.equals("READ_WRITE")) {
+                out.write("ERROR:FILE_NOT_OPEN_FOR_READ\n");
+                out.flush();
+                return;
+            }
+
+            File file = new File(STORAGE_DIR, filePath);
+            String content = "";
+            if (file.exists()) {
+                content = readFile(file);
+            }
+
+            out.write("OK\n");
+            out.write(content + "\n");
+            out.flush();
+            System.out.println("File " + filePath + " read by " + clientId);
+        }
+
+        // WRITE コマンドの処理
+        private void handleWriteCommand(String filePath, String newContent, BufferedWriter out) throws IOException {
+            System.out.println("Handling WRITE for " + clientId + ": " + filePath);
+
+            if (!openFiles.containsKey(filePath)) {
+                out.write("ERROR:FILE_NOT_OPEN\n");
+                out.flush();
+                return;
+            }
+
+            String mode = openFiles.get(filePath);
+            if (!mode.equals("WRITE_ONLY") && !mode.equals("READ_WRITE")) {
+                out.write("ERROR:FILE_NOT_OPEN_FOR_WRITE\n");
+                out.flush();
+                return;
+            }
+
+            File file = new File(STORAGE_DIR, filePath);
+            writeFile(file, newContent);
+
+            out.write("OK\n");
+            out.flush();
+            System.out.println("File " + filePath + " written by " + clientId);
+        }
+
+        // CLOSE コマンドの処理
+        private void handleCloseCommand(String filePath, String mode, String content, BufferedWriter out) throws IOException {
+            System.out.println("Handling CLOSE for " + clientId + ": " + filePath);
+
+            if (!openFiles.containsKey(filePath)) {
+                out.write("ERROR:FILE_NOT_OPEN\n");
+                out.flush();
+                return;
+            }
+
+            String currentMode = openFiles.get(filePath);
+            if (!currentMode.equals(mode)) {
+                out.write("ERROR:MODE_MISMATCH\n");
+                out.flush();
+                return;
+            }
+
+            if (!mode.equals("READ_ONLY")) {
+                // ファイルを保存（上書き）
+                File file = new File(STORAGE_DIR, filePath);
+                writeFile(file, content);
+
+                // ロックを解除
+                lockedFiles.remove(filePath, clientId);
+                System.out.println("Lock released for " + filePath + " by " + clientId);
+            }
+
+            openFiles.remove(filePath);
+            out.write("OK\n");
+            out.flush();
+            System.out.println("File " + filePath + " closed by " + clientId);
+        }
+
+        // SEND_MESSAGE コマンドの処理
+        private void handleSendMessage(String message, BufferedWriter out) throws IOException {
+            String chatFilePath = "chat.txt";
             System.out.println("Handling SEND_MESSAGE for " + clientId + ": " + message);
 
             // メッセージのバリデーション
             if (!isValidMessage(message)) {
-                writer.write("ERROR:INVALID_MESSAGE\n");
-                writer.flush();
+                out.write("ERROR:INVALID_MESSAGE\n");
+                out.flush();
                 System.out.println("Invalid message from " + clientId + ": " + message);
                 return;
             }
@@ -149,9 +302,9 @@ public class Server {
                 String currentLockOwner = lockedFiles.get(chatFilePath);
                 if (!currentLockOwner.equals(clientId)) {
                     // 他のクライアントがロックを保持している場合
+                    out.write("ERROR:CHAT_FILE_LOCKED\n");
+                    out.flush();
                     System.err.println("Chat file is locked by " + currentLockOwner);
-                    writer.write("ERROR:CHAT_FILE_LOCKED\n");
-                    writer.flush();
                     return;
                 }
             }
@@ -165,13 +318,13 @@ public class Server {
                 File chatFile = new File(STORAGE_DIR, chatFilePath);
                 writeFile(chatFile, formattedMessage);
 
-                writer.write("OK:MESSAGE_SENT\n");
-                writer.flush();
+                out.write("OK:MESSAGE_SENT\n");
+                out.flush();
                 System.out.println("Message sent to chat: " + formattedMessage.trim());
             } catch (IOException e) {
                 System.err.println("Failed to write message to chat.txt for " + clientId + ": " + e.getMessage());
-                writer.write("ERROR:FAILED_TO_WRITE_CHAT\n");
-                writer.flush();
+                out.write("ERROR:FAILED_TO_WRITE_CHAT\n");
+                out.flush();
             } finally {
                 // ロック解除
                 lockedFiles.remove(chatFilePath, clientId);
@@ -179,8 +332,9 @@ public class Server {
             }
         }
 
-        private void handleReadChat() throws IOException {
-            String chatFilePath = "chat.txt"; // 対象ファイル
+        // READ_CHAT コマンドの処理
+        private void handleReadChat(BufferedWriter out) throws IOException {
+            String chatFilePath = "chat.txt";
             System.out.println("Handling READ_CHAT for " + clientId);
 
             // ロックの取得
@@ -189,9 +343,9 @@ public class Server {
                 String currentLockOwner = lockedFiles.get(chatFilePath);
                 if (!currentLockOwner.equals(clientId)) {
                     // 他のクライアントがロックを保持している場合
+                    out.write("ERROR:CHAT_FILE_LOCKED\n");
+                    out.flush();
                     System.err.println("Chat file is locked by " + currentLockOwner);
-                    writer.write("ERROR:CHAT_FILE_LOCKED\n");
-                    writer.flush();
                     return;
                 }
             }
@@ -204,14 +358,14 @@ public class Server {
                     chatContent = readFile(chatFile);
                 }
 
-                writer.write("OK\n");
-                writer.write(chatContent + "\n");
-                writer.flush();
+                out.write("OK\n");
+                out.write(chatContent + "\n");
+                out.flush();
                 System.out.println("Chat content sent to " + clientId);
             } catch (IOException e) {
                 System.err.println("Failed to read chat.txt for " + clientId + ": " + e.getMessage());
-                writer.write("ERROR:FAILED_TO_READ_CHAT\n");
-                writer.flush();
+                out.write("ERROR:FAILED_TO_READ_CHAT\n");
+                out.flush();
             } finally {
                 // ロック解除
                 lockedFiles.remove(chatFilePath, clientId);
