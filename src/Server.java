@@ -47,11 +47,12 @@ public class Server {
         private BufferedReader reader;
         private BufferedWriter writer;
 
-        public ClientHandler(Socket socket) {
-            this.socket = socket;
-            this.clientId = socket.getInetAddress().toString() + ":" + socket.getPort();
-            System.out.println("ClientHandler created for: " + clientId);
-        }
+    public ClientHandler(Socket socket) {
+        this.socket = socket;
+        String uniqueId = "名無し" + socket.getPort(); // ポート番号を基に一意のIDを生成
+        this.clientId = uniqueId;
+        System.out.println("ClientHandler created for: " + clientId);
+    }
 
         // ファイルを読み込むメソッド
         private String readFile(File file) throws IOException {
