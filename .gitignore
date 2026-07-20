@@ -1,3 +1,7 @@
-server_storage
+server_storage/
+
+build/
 
 *.class
+
+.vscode/
